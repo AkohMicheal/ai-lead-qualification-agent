@@ -12,16 +12,18 @@ const SYSTEM_PROMPT = `
 You are a concise, professional real estate lead qualification assistant. 
 Your ONLY goal is to guide the user through a strict 4-step qualification process and then route them to a human agent. 
 
-Follow this exact sequence. Do not ask multiple questions at once. Wait for the user to answer before moving to the next step.
-
+Follow this sequence step-by-step:
 Step 1: Ask if they are looking to buy, rent, or sell.
 Step 2: Ask for their preferred location and budget range.
 Step 3: Ask for their timeline (when they need to move).
 Step 4: Ask for their phone number so an agent can contact them to confirm viewings.
 
 Rules:
-- Be polite, welcoming, and brief.
-- If a user goes off-topic, politely decline and steer them back to the current step.
+- Be polite, welcoming, and brief. Do not ask multiple questions at once.
+- NEVER repeat a question that has already been asked or answered in the conversation history. Review the previous messages carefully before responding.
+- If the assistant has ALREADY asked for their timeline (e.g. "when are you looking to move" or "when do you need to move"), any subsequent user answer MUST be treated as their timeline response; immediately proceed to Step 4 (ask for their phone number). NEVER ask when they are looking to move a second time.
+- If the user provides an answer to a step (even if brief, e.g. "immediately", "in 2 months", "now", "next year", "December", "asap"), acknowledge it and IMMEDIATELY move forward to the next step.
+- If the user provides details for multiple steps at once (e.g. location, budget, and timeline together), acknowledge both and move directly to the next unanswered step (e.g. Step 4 phone number). Never re-ask for information the user already shared.
 - Once you collect the phone number in Step 4, thank them, confirm that an agent will reach out shortly, wish them a great day, and DO NOT ask any further questions.
 - Never invent properties or prices.
 `;
@@ -31,7 +33,7 @@ async function triggerMakeWebhook(messages: any[]) {
     try {
         const userText = messages
             .filter((m: any) => m.role === 'user')
-            .map((m: any) => m.parts?.map((p: any) => p.text).join(' '))
+            .map((m: any) => getMessageText(m))
             .join(' | ');
 
         // Detect if user has provided a phone number (10+ digits)
@@ -56,27 +58,128 @@ async function triggerMakeWebhook(messages: any[]) {
     }
 }
 
-// Deterministic offline fallback engine for demo recordings when API quota is exhausted
-function getMockResponse(userMessage: string, messageCount: number): string {
-    const text = userMessage.toLowerCase();
+function getMessageText(m: any): string {
+    if (!m) return '';
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.parts)) {
+        return m.parts
+            .map((p: any) => (p && typeof p.text === 'string' ? p.text : ''))
+            .filter(Boolean)
+            .join(' ');
+    }
+    return '';
+}
 
-    if (text.includes('buy') || text.includes('rent') || text.includes('sell')) {
-        return "Got it! What is your preferred location and budget range?";
-    }
-    if (text.includes('lekki') || text.includes('island') || text.includes('ikeja') || text.includes('million') || text.includes('budget') || text.includes('₦')) {
-        return "That's a great choice. When are you looking to move or complete this transaction?";
-    }
-    if (text.includes('month') || text.includes('week') || text.includes('asap') || text.includes('soon') || text.includes('year')) {
-        return "Understood. Lastly, could you please share your phone number so one of our senior agents can reach out to confirm your viewing schedule?";
-    }
-    if (/\b\d{10,}\b/.test(text) || text.includes('phone') || text.includes('08')) {
+// Deterministic conversation-state engine for demo recordings & quota fallback
+function getMockResponse(messages: any[]): string {
+    const userMessages = messages.filter((m: any) => m.role === 'user');
+    const assistantMessages = messages.filter((m: any) => m.role === 'assistant');
+
+    const lastUserText = getMessageText(userMessages[userMessages.length - 1]).toLowerCase();
+    const allUserText = userMessages.map((m: any) => getMessageText(m).toLowerCase()).join(' | ');
+    const allAssistantText = assistantMessages.map((m: any) => getMessageText(m).toLowerCase()).join(' | ');
+
+    // Check if phone number is provided anywhere (10+ digits or Nigerian mobile format)
+    const hasPhone =
+        /\b\d{10,}\b/.test(allUserText) ||
+        /\b0[789][01]\d{8}\b/.test(allUserText) ||
+        allUserText.includes('phone') ||
+        allUserText.includes('080') ||
+        allUserText.includes('081') ||
+        allUserText.includes('090') ||
+        allUserText.includes('070');
+
+    // What questions has the assistant already asked in previous turns?
+    const askedPhone =
+        allAssistantText.includes('phone number') ||
+        allAssistantText.includes('share your phone') ||
+        allAssistantText.includes('number so an agent');
+
+    const askedTimeline =
+        allAssistantText.includes('when are you looking') ||
+        allAssistantText.includes('when do you need to move') ||
+        allAssistantText.includes('timeline') ||
+        allAssistantText.includes('complete this transaction') ||
+        allAssistantText.includes('when to move') ||
+        allAssistantText.includes('when are you looking to move');
+
+    const askedLocationBudget =
+        allAssistantText.includes('location') ||
+        allAssistantText.includes('budget');
+
+    // 1. Once phone number is provided or step 4 was already asked, provide final wrap-up
+    if (hasPhone || (askedPhone && userMessages.length >= 4)) {
         return "Thank you! Your details have been securely routed to our agent team. An agent will reach out shortly. Have a great day!";
     }
 
-    if (messageCount <= 2) return "Are you looking to buy, rent, or sell a property?";
-    if (messageCount <= 4) return "What is your preferred location and budget range?";
-    if (messageCount <= 6) return "When are you looking to move?";
-    return "Please share your phone number so an agent can contact you.";
+    // 2. CRITICAL FIX: If the assistant ALREADY asked for their timeline,
+    // the user's latest response is their timeline. Move forward to Step 4 (Phone Number)!
+    if (askedTimeline) {
+        return "Understood. Lastly, could you please share your phone number so one of our senior agents can reach out to confirm your viewing schedule?";
+    }
+
+    // Check if user provided timeline in current or previous text
+    const hasTimeline =
+        lastUserText.includes('month') ||
+        lastUserText.includes('week') ||
+        lastUserText.includes('asap') ||
+        lastUserText.includes('soon') ||
+        lastUserText.includes('year') ||
+        lastUserText.includes('immediately') ||
+        lastUserText.includes('now') ||
+        lastUserText.includes('december') ||
+        lastUserText.includes('january') ||
+        lastUserText.includes('february') ||
+        lastUserText.includes('march') ||
+        lastUserText.includes('april') ||
+        lastUserText.includes('may') ||
+        lastUserText.includes('june') ||
+        lastUserText.includes('july') ||
+        lastUserText.includes('august') ||
+        lastUserText.includes('september') ||
+        lastUserText.includes('october') ||
+        lastUserText.includes('november') ||
+        lastUserText.includes('days') ||
+        lastUserText.includes('tomorrow') ||
+        lastUserText.includes('urgent') ||
+        lastUserText.includes('flexible');
+
+    // 3. If location and budget were already asked
+    if (askedLocationBudget) {
+        // If user also already mentioned their timeline in this turn, skip Step 3 and ask for Phone
+        if (hasTimeline) {
+            return "Understood. Lastly, could you please share your phone number so one of our senior agents can reach out to confirm your viewing schedule?";
+        }
+        return "That's a great choice. When are you looking to move or complete this transaction?";
+    }
+
+    // 4. If user already indicated intent (buy, rent, sell)
+    const hasIntent =
+        allUserText.includes('buy') ||
+        allUserText.includes('rent') ||
+        allUserText.includes('sell');
+
+    if (hasIntent) {
+        // Check if user also gave location & budget in the same turn
+        const hasLocationBudget =
+            (lastUserText.includes('million') || lastUserText.includes('₦') || lastUserText.includes('budget') || /\b\d+m\b/.test(lastUserText) || lastUserText.includes('k')) &&
+            (lastUserText.includes('lekki') || lastUserText.includes('island') || lastUserText.includes('ikeja') || lastUserText.includes('abuja') || lastUserText.includes('in ') || lastUserText.includes('at '));
+
+        if (hasLocationBudget) {
+            if (hasTimeline) {
+                return "Understood. Lastly, could you please share your phone number so one of our senior agents can reach out to confirm your viewing schedule?";
+            }
+            return "That's a great choice. When are you looking to move or complete this transaction?";
+        }
+
+        return "Got it! What is your preferred location and budget range?";
+    }
+
+    // 5. Default fallback progression based on user turn count
+    if (userMessages.length <= 1) return "Are you looking to buy, rent, or sell a property?";
+    if (userMessages.length <= 2) return "Got it! What is your preferred location and budget range?";
+    if (userMessages.length <= 3) return "That's a great choice. When are you looking to move or complete this transaction?";
+    return "Understood. Lastly, could you please share your phone number so one of our senior agents can reach out to confirm your viewing schedule?";
 }
 
 function createMockStreamResponse(mockReply: string) {
@@ -93,18 +196,6 @@ function createMockStreamResponse(mockReply: string) {
     return createUIMessageStreamResponse({ stream });
 }
 
-function extractLastUserText(messages: any[]): string {
-    const lastUserMsg = messages?.filter((m: any) => m.role === 'user').pop();
-    if (!lastUserMsg) return '';
-    if (Array.isArray(lastUserMsg.parts)) {
-        return lastUserMsg.parts
-            .map((p: any) => (p && typeof p.text === 'string' ? p.text : ''))
-            .filter(Boolean)
-            .join(' ');
-    }
-    return typeof lastUserMsg.content === 'string' ? lastUserMsg.content : '';
-}
-
 export async function POST(req: Request) {
     let body: any;
     try {
@@ -114,8 +205,7 @@ export async function POST(req: Request) {
         // Trigger Make.com webhook in the background when phone number is collected
         void triggerMakeWebhook(messages);
 
-        const userText = extractLastUserText(messages);
-        const mockReply = getMockResponse(userText, messages.length);
+        const mockReply = getMockResponse(messages);
 
         const url = new URL(req.url);
         const isDemoMode =
@@ -138,7 +228,7 @@ export async function POST(req: Request) {
             messages: modelMessages,
             temperature: 0.2,
             maxRetries: 0,
-            abortSignal: AbortSignal.timeout(2500),
+            abortSignal: AbortSignal.timeout(3500),
         });
 
         // Intercept stream errors (e.g. 429 Quota Exceeded, timeout) to instantly fall back to mock
@@ -189,8 +279,7 @@ export async function POST(req: Request) {
         // Trigger webhook even on fallback mock mode during testing
         void triggerMakeWebhook(messages);
 
-        const userText = extractLastUserText(messages);
-        const mockReply = getMockResponse(userText, messages.length);
+        const mockReply = getMockResponse(messages);
 
         return createMockStreamResponse(mockReply);
     }
